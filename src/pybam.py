@@ -365,21 +365,21 @@ class read:
             raise PybamWarn('For some reason the BAM format stores the chromosome names in two locations,\n       the ASCII text header we all know and love, viewable with samtools view -H, and another special binary header\n       which is used to translate the chromosome refID (a number) into a chromosome RNAME when you do bam -> sam.\n\nThese two headers should always be the same, but apparently they are not:\nThe ASCII header looks like: ' + self.file_header + '\nWhile the binary header has the following chromosomes: ' + self.file_chromosomes + '\n')
 
         ## Variable parsing:
-        def new_entry(header_cache):
-            cache = header_cache # we keep a small cache of X bytes of decompressed BAM data, to smoothen out disk access.
-            p = 0 # where the next alignment/entry starts in the cache
-            while True:
-                try:
-                    while len(cache) < p + 4: cache = cache[p:] + next(self._generator); p = 0 # Grab enough bytes to parse blocksize
-                    self.sam_block_size  = unpack('<i',cache[p:p+4])[0]
-                    self.file_alignments_read += 1
-                    while len(cache) < p + 4 + self.sam_block_size:
-                        cache = cache[p:] + next(self._generator); p = 0 # Grab enough bytes to parse entry
-                except StopIteration: break
-                self.bam = cache[p:p + 4 + self.sam_block_size]
-                p = p + 4 + self.sam_block_size
-                yield self
-        self._new_entry = new_entry(header_cache)
+    def new_entry(self,header_cache):
+        cache = header_cache # we keep a small cache of X bytes of decompressed BAM data, to smoothen out disk access.
+        p = 0 # where the next alignment/entry starts in the cache
+        while True:
+            try:
+                while len(cache) < p + 4: cache = cache[p:] + next(self._generator); p = 0 # Grab enough bytes to parse blocksize
+                self.sam_block_size  = unpack('<i',cache[p:p+4])[0]
+                self.file_alignments_read += 1
+                while len(cache) < p + 4 + self.sam_block_size:
+                    cache = cache[p:] + next(self._generator); p = 0 # Grab enough bytes to parse entry
+            except StopIteration: break
+            self.bam = cache[p:p + 4 + self.sam_block_size]
+            p = p + 4 + self.sam_block_size
+            yield self
+        self._new_entry = self.new_entry(header_cache)
 
         def compile_parser(self,fields):
             temp_code = ''
