@@ -164,164 +164,9 @@ class read:
             else: raise PybamError('\n\nUser-supplied decompressor must be a string that when run on the command line decompresses a named file (or stdin), to stdout:\ne.g. "lzma --decompress --stdout {}" if pybam is provided a path as input file, where {} is substituted for that path.\nor just "lzma --decompress --stdout" if pybam is provided a file object instead of a file path, as data from that file object will be piped via stdin to the decompression program.\n')
 
         ## First we make a generator that will return chunks of uncompressed data, regardless of how we choose to decompress:
-        def generator():
-            DEVNULL = open(os.devnull, 'wb')
-
-            # First we need to figure out what sort of file we have - whether it's gzip compressed, uncompressed, or something else entirely!
-            if type(f) is str:
-                try: self._file = open(f,'rb')
-                except: raise PybamError('\n\nCould not open "' + str(self._file.name) + '" for reading!\n')
-                try: magic = os.read(self._file.fileno(),4)
-                except: raise PybamError('\n\nCould not read from "' + str(self._file.name) + '"!\n')
-            elif type(f) is file:
-                self._file = f
-                try: magic = os.read(self._file.fileno(),4)
-                except: raise PybamError('\n\nCould not read from "' + str(self._file.name) + '"!\n')
-            else: raise PybamError('\n\nInput file was not a string or a file object. It was: "' + str(f) + '"\n')
-
-            self.file_name = os.path.basename(os.path.realpath(self._file.name))
-            self.file_directory = os.path.dirname(os.path.realpath(self._file.name))
-
-            if magic == 'BAM\1':
-                # The user has passed us already unzipped BAM data! Job done :)
-                data = 'BAM\1' + self._file.read(35536)
-                self.file_bytes_read += len(data)
-                self.file_decompressor = 'None'
-                while data:
-                    yield data
-                    data = self._file.read(35536)
-                    self.file_bytes_read += len(data)
-                self._file.close()
-                DEVNULL.close()
-                raise StopIteration
-
-            elif magic == "\x1f\x8b\x08\x04":  # The user has passed us compressed gzip/bgzip data, which is typical for a BAM file
-                # use custom decompressor if provided:
-                if decompressor is not False and decompressor is not 'internal':
-                    if type(f) is str: self._subprocess = subprocess.Popen(                                    decompressor.replace('{}',f),    shell=True, stdout=subprocess.PIPE, stderr=DEVNULL)
-                    else:              self._subprocess = subprocess.Popen('{ printf "'+magic+'"; cat; } | ' + decompressor, stdin=self._file, shell=True, stdout=subprocess.PIPE, stderr=DEVNULL)
-                    self.file_decompressor = decompressor
-                    data = self._subprocess.stdout.read(35536)
-                    self.file_bytes_read += len(data)
-                    while data:
-                        yield data
-                        data = self._subprocess.stdout.read(35536)
-                        self.file_bytes_read += len(data)
-                    self._file.close()
-                    DEVNULL.close()
-                    raise StopIteration
-
-                # else look for pigz or gzip:
-                else:
-                    try:
-                        self._subprocess = subprocess.Popen(["pigz"],stdin=DEVNULL,stdout=DEVNULL,stderr=DEVNULL)
-                        if self._subprocess.returncode is None: self._subprocess.kill()
-                        use = 'pigz'
-                    except OSError:
-                        try:
-                            self._subprocess = subprocess.Popen(["gzip"],stdin=DEVNULL,stdout=DEVNULL,stderr=DEVNULL)
-                            if self._subprocess.returncode is None: self._subprocess.kill()
-                            use = 'gzip'
-                        except OSError: use = 'internal'
-
-                    if use is not 'internal' and decompressor is not 'internal':
-                        if type(f) is str: self._subprocess = subprocess.Popen([                                   use , '--decompress','--stdout',       f           ], stdout=subprocess.PIPE, stderr=DEVNULL)
-                        else:              self._subprocess = subprocess.Popen('{ printf "'+magic+'"; cat; } | ' + use + ' --decompress  --stdout', stdin=f, shell=True, stdout=subprocess.PIPE, stderr=DEVNULL)
-                        time.sleep(1)
-                        if self._subprocess.poll() == None:
-                            data = self._subprocess.stdout.read(35536)
-                            self.file_decompressor = use
-                            self.file_bytes_read += len(data)
-                            while data:
-                                yield data
-                                data = self._subprocess.stdout.read(35536)
-                                self.file_bytes_read += len(data)
-                            self._file.close()
-                            DEVNULL.close()
-                            raise StopIteration
-
-                    # Python's gzip module can't read from a stream that doesn't support seek(), and the zlib module cannot read the bgzip format without a lot of help:
-                    self.file_decompressor = 'internal'
-                    raw_data = magic + self._file.read(65536)
-                    self.file_bytes_read = len(raw_data)
-                    internal_cache = []
-                    blocks_left_to_grab = 50
-                    bs = 0
-                    checkpoint = 0
-                    decompress = zlib.decompress
-                    while raw_data:
-                        if len(raw_data) - bs < 35536:
-                            raw_data = raw_data[bs:] + self._file.read(65536)
-                            self.file_bytes_read += len(raw_data) - bs
-                            bs = 0
-                        magic = raw_data[bs:bs+4]
-                        if not magic: break # a child's heart
-                        if magic != "\x1f\x8b\x08\x04": raise PybamError('\n\nThe input file is not in a format I understand. First four bytes: ' + repr(magic) + '\n')
-                        try:
-                            more_bs = bs + unpack("<H", raw_data[bs+16:bs+18])[0] +1
-                            internal_cache.append(decompress(raw_data[bs+18:more_bs-8],-15))
-                            bs = more_bs
-                        except: ## zlib doesnt have a nice exception for when things go wrong. just "error"
-                            header_data = magic + raw_data[bs+4:bs+12]
-                            header_size = 12
-                            extra_len = unpack("<H", header_data[-2:])[0]
-                            while header_size-12 < extra_len:
-                                header_data += raw_data[bs+12:bs+16]
-                                subfield_id = header_data[-4:-2]
-                                subfield_len = unpack("<H", header_data[-2:])[0]
-                                subfield_data = raw_data[bs+16:bs+16+subfield_len]
-                                header_data += subfield_data
-                                header_size += subfield_len + 4
-                                if subfield_id == 'BC': block_size = unpack("<H", subfield_data)[0]
-                            raw_data = raw_data[bs+16+subfield_len:bs+16+subfield_len+block_size-extra_len-19]
-                            crc_data = raw_data[bs+16+subfield_len+block_size-extra_len-19:bs+16+subfield_len+block_size-extra_len-19+8] # I have left the numbers in verbose, because the above try is the optimised code.
-                            bs = bs+16+subfield_len+block_size-extra_len-19+8
-                            zipped_data = header_data + raw_data + crc_data
-                            internal_cache.append(decompress(zipped_data,47)) # 31 works the same as 47.
-                            # Although the following in the bgzip code from biopython, its not needed if you let zlib decompress the whole zipped_data, header and crc, because it checks anyway (in C land)
-                            # I've left the manual crc checks in for documentation purposes:
-                            '''
-                            expected_crc = crc_data[:4]
-                            expected_size = unpack("<I", crc_data[4:])[0]
-                            if len(unzipped_data) != expected_size: print 'ERROR: Failed to unpack due to a Type 1 CRC error. Could the BAM be corrupted?'; exit()
-                            crc = zlib.crc32(unzipped_data)
-                            if crc < 0: crc = pack("<i", crc)
-                            else:       crc = pack("<I", crc)
-                            if expected_crc != crc: print 'ERROR: Failed to unpack due to a Type 2 CRC error. Could the BAM be corrupted?'; exit()
-                            '''
-                        blocks_left_to_grab -= 1
-                        if blocks_left_to_grab == 0:
-                            yield ''.join(internal_cache)
-                            internal_cache = []
-                            blocks_left_to_grab = 50
-                    self._file.close()
-                    DEVNULL.close()
-                    if internal_cache != '': yield ''.join(internal_cache)
-                    raise StopIteration
-
-            elif decompressor is not False and decompressor is not 'internal':
-                # It wouldn't be safe to just print to the shell four random bytes from the beginning of a file, so instead it's
-                # written to a temp file and cat'd. The idea here being that we trust the decompressor string as it was written by 
-                # someone with access to python, so it has system access anyway. The file/data, however, should not be trusted.
-                magic_file = os.path.join(tempfile.mkdtemp(),'magic')
-                with open(magic_file,'wb') as mf: mf.write(magic)
-                if type(f) is str: self._subprocess = subprocess.Popen(                                      decompressor.replace('{}',f),    shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                else:              self._subprocess = subprocess.Popen('{ cat "'+magic_file+'"; cat; } | ' + decompressor, stdin=self._file, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
-                self.file_decompressor = decompressor
-                data = self._subprocess.stdout.read(35536)
-                self.file_bytes_read += len(data)
-                while data:
-                    yield data
-                    data = self._subprocess.stdout.read(35536)
-                    self.file_bytes_read += len(data)
-                self._file.close()
-                DEVNULL.close()
-                raise StopIteration
-            else:
-                raise PybamError('\n\nThe input file is not in a format I understand. First four bytes: ' + repr(magic) + '\n')
 
         ## At this point, we know that whatever decompression method was used, a call to self._generator will return some uncompressed data.
-        self._generator = generator()
+        self._generator = self.generator(f,decompressor)
 
         ## So lets parse the BAM header:
         header_cache = ''
@@ -364,7 +209,193 @@ class read:
         if chromosomes_from_header != self.file_chromosomes:
             raise PybamWarn('For some reason the BAM format stores the chromosome names in two locations,\n       the ASCII text header we all know and love, viewable with samtools view -H, and another special binary header\n       which is used to translate the chromosome refID (a number) into a chromosome RNAME when you do bam -> sam.\n\nThese two headers should always be the same, but apparently they are not:\nThe ASCII header looks like: ' + self.file_header + '\nWhile the binary header has the following chromosomes: ' + self.file_chromosomes + '\n')
 
-        ## Variable parsing:
+    def generator(self,f,compressor):
+        DEVNULL = open(os.devnull, 'wb')
+
+        # First we need to figure out what sort of file we have - whether it's gzip compressed, uncompressed, or something else entirely!
+        if type(f) is str:
+            try:
+                self._file = open(f, 'rb')
+            except:
+                raise PybamError('\n\nCould not open "' + str(self._file.name) + '" for reading!\n')
+            try:
+                magic = os.read(self._file.fileno(), 4)
+            except:
+                raise PybamError('\n\nCould not read from "' + str(self._file.name) + '"!\n')
+        elif type(f) is file:
+            self._file = f
+            try:
+                magic = os.read(self._file.fileno(), 4)
+            except:
+                raise PybamError('\n\nCould not read from "' + str(self._file.name) + '"!\n')
+        else:
+            raise PybamError('\n\nInput file was not a string or a file object. It was: "' + str(f) + '"\n')
+
+        self.file_name = os.path.basename(os.path.realpath(self._file.name))
+        self.file_directory = os.path.dirname(os.path.realpath(self._file.name))
+
+        if magic == 'BAM\1':
+            # The user has passed us already unzipped BAM data! Job done :)
+            data = 'BAM\1' + self._file.read(35536)
+            self.file_bytes_read += len(data)
+            self.file_decompressor = 'None'
+            while data:
+                yield data
+                data = self._file.read(35536)
+                self.file_bytes_read += len(data)
+            self._file.close()
+            DEVNULL.close()
+            raise StopIteration
+
+        elif magic == "\x1f\x8b\x08\x04":  # The user has passed us compressed gzip/bgzip data, which is typical for a BAM file
+            # use custom decompressor if provided:
+            if decompressor is not False and decompressor is not 'internal':
+                if type(f) is str:
+                    self._subprocess = subprocess.Popen(decompressor.replace('{}', f), shell=True,
+                                                        stdout=subprocess.PIPE, stderr=DEVNULL)
+                else:
+                    self._subprocess = subprocess.Popen('{ printf "' + magic + '"; cat; } | ' + decompressor,
+                                                        stdin=self._file, shell=True, stdout=subprocess.PIPE,
+                                                        stderr=DEVNULL)
+                self.file_decompressor = decompressor
+                data = self._subprocess.stdout.read(35536)
+                self.file_bytes_read += len(data)
+                while data:
+                    yield data
+                    data = self._subprocess.stdout.read(35536)
+                    self.file_bytes_read += len(data)
+                self._file.close()
+                DEVNULL.close()
+                raise StopIteration
+
+            # else look for pigz or gzip:
+            else:
+                try:
+                    self._subprocess = subprocess.Popen(["pigz"], stdin=DEVNULL, stdout=DEVNULL, stderr=DEVNULL)
+                    if self._subprocess.returncode is None: self._subprocess.kill()
+                    use = 'pigz'
+                except OSError:
+                    try:
+                        self._subprocess = subprocess.Popen(["gzip"], stdin=DEVNULL, stdout=DEVNULL,
+                                                            stderr=DEVNULL)
+                        if self._subprocess.returncode is None: self._subprocess.kill()
+                        use = 'gzip'
+                    except OSError:
+                        use = 'internal'
+
+                if use is not 'internal' and decompressor is not 'internal':
+                    if type(f) is str:
+                        self._subprocess = subprocess.Popen([use, '--decompress', '--stdout', f],
+                                                            stdout=subprocess.PIPE, stderr=DEVNULL)
+                    else:
+                        self._subprocess = subprocess.Popen(
+                            '{ printf "' + magic + '"; cat; } | ' + use + ' --decompress  --stdout', stdin=f,
+                            shell=True, stdout=subprocess.PIPE, stderr=DEVNULL)
+                    time.sleep(1)
+                    if self._subprocess.poll() == None:
+                        data = self._subprocess.stdout.read(35536)
+                        self.file_decompressor = use
+                        self.file_bytes_read += len(data)
+                        while data:
+                            yield data
+                            data = self._subprocess.stdout.read(35536)
+                            self.file_bytes_read += len(data)
+                        self._file.close()
+                        DEVNULL.close()
+                        raise StopIteration
+
+                # Python's gzip module can't read from a stream that doesn't support seek(), and the zlib module cannot read the bgzip format without a lot of help:
+                self.file_decompressor = 'internal'
+                raw_data = magic + self._file.read(65536)
+                self.file_bytes_read = len(raw_data)
+                internal_cache = []
+                blocks_left_to_grab = 50
+                bs = 0
+                checkpoint = 0
+                decompress = zlib.decompress
+                while raw_data:
+                    if len(raw_data) - bs < 35536:
+                        raw_data = raw_data[bs:] + self._file.read(65536)
+                        self.file_bytes_read += len(raw_data) - bs
+                        bs = 0
+                    magic = raw_data[bs:bs + 4]
+                    if not magic: break  # a child's heart
+                    if magic != "\x1f\x8b\x08\x04": raise PybamError(
+                        '\n\nThe input file is not in a format I understand. First four bytes: ' + repr(
+                            magic) + '\n')
+                    try:
+                        more_bs = bs + unpack("<H", raw_data[bs + 16:bs + 18])[0] + 1
+                        internal_cache.append(decompress(raw_data[bs + 18:more_bs - 8], -15))
+                        bs = more_bs
+                    except:  ## zlib doesnt have a nice exception for when things go wrong. just "error"
+                        header_data = magic + raw_data[bs + 4:bs + 12]
+                        header_size = 12
+                        extra_len = unpack("<H", header_data[-2:])[0]
+                        while header_size - 12 < extra_len:
+                            header_data += raw_data[bs + 12:bs + 16]
+                            subfield_id = header_data[-4:-2]
+                            subfield_len = unpack("<H", header_data[-2:])[0]
+                            subfield_data = raw_data[bs + 16:bs + 16 + subfield_len]
+                            header_data += subfield_data
+                            header_size += subfield_len + 4
+                            if subfield_id == 'BC': block_size = unpack("<H", subfield_data)[0]
+                        raw_data = raw_data[
+                                   bs + 16 + subfield_len:bs + 16 + subfield_len + block_size - extra_len - 19]
+                        crc_data = raw_data[
+                                   bs + 16 + subfield_len + block_size - extra_len - 19:bs + 16 + subfield_len + block_size - extra_len - 19 + 8]  # I have left the numbers in verbose, because the above try is the optimised code.
+                        bs = bs + 16 + subfield_len + block_size - extra_len - 19 + 8
+                        zipped_data = header_data + raw_data + crc_data
+                        internal_cache.append(decompress(zipped_data, 47))  # 31 works the same as 47.
+                        # Although the following in the bgzip code from biopython, its not needed if you let zlib decompress the whole zipped_data, header and crc, because it checks anyway (in C land)
+                        # I've left the manual crc checks in for documentation purposes:
+                        '''
+                        expected_crc = crc_data[:4]
+                        expected_size = unpack("<I", crc_data[4:])[0]
+                        if len(unzipped_data) != expected_size: print 'ERROR: Failed to unpack due to a Type 1 CRC error. Could the BAM be corrupted?'; exit()
+                        crc = zlib.crc32(unzipped_data)
+                        if crc < 0: crc = pack("<i", crc)
+                        else:       crc = pack("<I", crc)
+                        if expected_crc != crc: print 'ERROR: Failed to unpack due to a Type 2 CRC error. Could the BAM be corrupted?'; exit()
+                        '''
+                    blocks_left_to_grab -= 1
+                    if blocks_left_to_grab == 0:
+                        yield ''.join(internal_cache)
+                        internal_cache = []
+                        blocks_left_to_grab = 50
+                self._file.close()
+                DEVNULL.close()
+                if internal_cache != '': yield ''.join(internal_cache)
+                raise StopIteration
+
+        elif decompressor is not False and decompressor is not 'internal':
+            # It wouldn't be safe to just print to the shell four random bytes from the beginning of a file, so instead it's
+            # written to a temp file and cat'd. The idea here being that we trust the decompressor string as it was written by
+            # someone with access to python, so it has system access anyway. The file/data, however, should not be trusted.
+            magic_file = os.path.join(tempfile.mkdtemp(), 'magic')
+            with open(magic_file, 'wb') as mf:
+                mf.write(magic)
+            if type(f) is str:
+                self._subprocess = subprocess.Popen(decompressor.replace('{}', f), shell=True,
+                                                    stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            else:
+                self._subprocess = subprocess.Popen('{ cat "' + magic_file + '"; cat; } | ' + decompressor,
+                                                    stdin=self._file, shell=True, stdout=subprocess.PIPE,
+                                                    stderr=subprocess.PIPE)
+            self.file_decompressor = decompressor
+            data = self._subprocess.stdout.read(35536)
+            self.file_bytes_read += len(data)
+            while data:
+                yield data
+                data = self._subprocess.stdout.read(35536)
+                self.file_bytes_read += len(data)
+            self._file.close()
+            DEVNULL.close()
+            raise StopIteration
+        else:
+            raise PybamError(
+                '\n\nThe input file is not in a format I understand. First four bytes: ' + repr(magic) + '\n')
+
+            ## Variable parsing:
     def new_entry(self,header_cache):
         cache = header_cache # we keep a small cache of X bytes of decompressed BAM data, to smoothen out disk access.
         p = 0 # where the next alignment/entry starts in the cache
